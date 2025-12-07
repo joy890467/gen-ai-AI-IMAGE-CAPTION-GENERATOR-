@@ -1,0 +1,173 @@
+import streamlit as st
+from PIL import Image
+from io import BytesIO
+import torch
+from transformers import BlipProcessor, BlipForConditionalGeneration
+from gtts import gTTS
+from dotenv import load_dotenv
+import os
+import tempfile
+
+# Load env (not required here but kept for future OpenAI integration)
+load_dotenv()
+
+st.set_page_config(page_title="AI Image Captioner — Multi & TTS", layout="centered")
+
+st.title("📸 AI Image Caption Generator — Multiple Captions + TTS")
+st.write(
+    "Upload an image, choose generation mode, how many captions you want, and play captions as audio."
+)
+
+# ----------------------------
+# Model loading (cached)
+# ----------------------------
+@st.cache_resource
+def load_blip():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+    model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
+    return processor, model, device
+
+processor, model, device = load_blip()
+
+# ----------------------------
+# Caption generation
+# ----------------------------
+def generate_captions(image: Image.Image, num_captions: int = 3, mode: str = "Deterministic (Beam Search)",
+                      max_new_tokens: int = 40, temperature: float = 1.0):
+    """
+    Returns a list of captions.
+    mode: "Deterministic (Beam Search)" or "Creative (Sampling)"
+    """
+    # prepare inputs
+    inputs = processor(images=image, return_tensors="pt").to(device)
+
+    # generation args
+    if mode.startswith("Deterministic"):
+        # Use beam search. num_beams must be >= num_return_sequences
+        num_beams = max(2, num_captions)
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            num_beams=num_beams,
+            num_return_sequences=num_captions,
+            early_stopping=True,
+            no_repeat_ngram_size=2
+        )
+    else:
+        # Creative sampling mode
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            top_k=50,
+            top_p=0.95,
+            temperature=max(0.1, float(temperature)),
+            num_return_sequences=num_captions,
+            no_repeat_ngram_size=2
+        )
+
+    captions = []
+    for seq in out:
+        text = processor.decode(seq, skip_special_tokens=True)
+        # small cleanup
+        text = text.strip()
+        if text not in captions:
+            captions.append(text)
+    # If duplicates removed and less than requested, try to fill (best-effort)
+    # (not strictly necessary; keep as is)
+    return captions
+
+# ----------------------------
+# Text-to-Speech (gTTS)
+# ----------------------------
+def caption_to_audio_bytes(caption: str, lang: str = "en") -> BytesIO:
+    """
+    Convert caption text to mp3 bytes using gTTS stored in a BytesIO.
+    """
+    tts = gTTS(text=caption, lang=lang)
+    audio_fp = BytesIO()
+    tts.write_to_fp(audio_fp)
+    audio_fp.seek(0)
+    return audio_fp
+
+# ----------------------------
+# UI Controls
+# ----------------------------
+st.sidebar.header("Generation Settings")
+mode = st.sidebar.radio("Generation mode", ("Deterministic (Beam Search)", "Creative (Sampling)"))
+num_captions = st.sidebar.slider("Number of captions", min_value=1, max_value=6, value=3)
+max_new_tokens = st.sidebar.slider("Max caption tokens", min_value=10, max_value=80, value=40)
+
+# Temperature only used in creative sampling
+if mode.startswith("Creative"):
+    temperature = st.sidebar.slider("Temperature (creativity)", min_value=0.1, max_value=1.5, value=1.0, step=0.1)
+else:
+    temperature = 1.0
+
+st.sidebar.write("---")
+st.sidebar.markdown("Tip: Use **Deterministic** for clearer, unique captions. Use **Creative** for variety.")
+st.sidebar.markdown("Audio generated with gTTS.")
+
+uploaded_file = st.file_uploader("Upload an image (jpg, png)", type=["jpg", "jpeg", "png"])
+if uploaded_file:
+    try:
+        image = Image.open(uploaded_file).convert("RGB")
+    except Exception as e:
+        st.error(f"Could not read image: {e}")
+        st.stop()
+
+    st.image(image, caption="Uploaded image", use_column_width=True)
+
+    if st.button("Generate captions"):
+        with st.spinner("Generating captions..."):
+            captions = generate_captions(
+                image=image,
+                num_captions=num_captions,
+                mode=mode,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature
+            )
+
+        if not captions:
+            st.warning("No captions were generated. Try increasing max tokens or switching modes.")
+        else:
+            st.success(f"Generated {len(captions)} caption(s).")
+
+            # Display and offer audio for each caption
+            for i, cap in enumerate(captions, start=1):
+                st.write(f"**Caption {i}:**")
+                st.info(cap)
+
+                cols = st.columns([0.1, 0.9])
+                # Play audio inline
+                with cols[1]:
+                    try:
+                        audio_bytes = caption_to_audio_bytes(cap)
+                        # Stream via st.audio - gTTS produced mp3 data
+                        st.audio(data=audio_bytes, format="audio/mp3")
+                        # Also offer a download link (temp file) for convenience
+                        # create a temp file for download
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+                        tmp.write(audio_bytes.getbuffer())
+                        tmp.flush()
+                        tmp.close()
+                        st.download_button(
+                            label="Download audio (mp3)",
+                            data=open(tmp.name, "rb"),
+                            file_name=f"caption_{i}.mp3",
+                            mime="audio/mpeg"
+                        )
+                    except Exception as e:
+                        st.error(f"Audio generation failed: {e}")
+
+            st.divider()
+            # Optional combined download of captions as text
+            if st.button("Download all captions as .txt"):
+                txt = "\n\n".join([f"Caption {i+1}: {c}" for i, c in enumerate(captions)])
+                st.download_button("Download captions", data=txt, file_name="captions.txt", mime="text/plain")
+else:
+    st.info("Upload an image to get started. Adjust settings in the left sidebar.")
+
+st.markdown("---")
+st.markdown("Developed with BLIP (Salesforce) for captioning and gTTS for on-device text-to-speech playback in browser.")
